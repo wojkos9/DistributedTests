@@ -25,7 +25,7 @@ class St(Enum):
 class TMsg:
     typ: MTyp
     sender: int
-    msg: str
+    data: dict
     cl: int
 
 def randintnot(a, b, n):
@@ -42,8 +42,12 @@ def debug(*args, **kwargs):
 
 DEBUG_LVL = 1
 
+class CSAlg(Enum):
+    LAMPORT = 0
+    RIC_AGR = 1
+
 class Worker(Thread):
-    def __init__(self, id, size, pool, sync=None):
+    def __init__(self, id, size, pool, sync=None, crit_sec_alg=CSAlg.LAMPORT):
         Thread.__init__(self, daemon=True)
         self.id = id
         self.size = size
@@ -57,13 +61,16 @@ class Worker(Thread):
         self.crit_lock = Lock()
         self.crit_lock.acquire()
         self.sync = sync
+        self.ricagr_count = 0
+        self.ricagr_req = None
+        self.crit_sec_alg = crit_sec_alg
 
     def debug(self, *args, **kwargs):
-        debug("[{}]".format(self.id), *args, **kwargs)
+        debug("[{}] {}".format(self.id, self.crit_sec_alg.name), *args, **kwargs)
 
-    def send(self, tid, typ=MTyp.DEF):
+    def send(self, tid, typ=MTyp.DEF, data={}):
         self.lclock += 1
-        self.pool.qu[tid].append(TMsg(typ, self.id, "", self.lclock))
+        self.pool.qu[tid].append(TMsg(typ, self.id, data, self.lclock))
         self.pool.sem[tid].release()
 
     def _recv(self) -> TMsg:
@@ -73,8 +80,8 @@ class Worker(Thread):
             lclock = max(self.lclock, m.cl) + 1
 
             prio = 2 if m.typ != MTyp.DEF else 3
-            self.debug("[<-{}-{}] [cl {}->{}] RECV: cl={}, msg=\"{}\""
-                .format(m.typ.name, m.sender, self.lclock, lclock, m.cl, m.msg), lvl=prio)
+            self.debug("[<-{}-{}] [cl {}->{}] RECV: cl={}, data=\"{}\""
+                .format(m.typ.name, m.sender, self.lclock, lclock, m.cl, m.data), lvl=prio)
             
             self.lclock = lclock
             return m
@@ -90,9 +97,6 @@ class Worker(Thread):
             self.debug("[msg {}/{}] IN CRIT:".format(i+1, sect_time), self.pool.status_report(St.CRIT),
                 "WAIT:", self.pool.status_report(St.WAIT), lvl=1)
             time.sleep(1)
-        
-        for i in range(self.size):
-            self.send(i, typ=MTyp.REL)
 
         debug("---------LEAVE {}---------->".format(self.id))
         self.status = St.IDLE
@@ -143,27 +147,79 @@ class Worker(Thread):
                 if self.crit_lock.locked():
                     self.crit_lock.release()
             return m
+
+    def lamport_post(self):
+        for i in range(self.size):
+            self.send(i, typ=MTyp.REL)
+
+    def ricagr_try(self):
+        if self.status == St.IDLE:
+            debug("---------TRY   {}----------?".format(self.id))
+            self.status = St.WAIT
+            self.ricagr_req = self.lclock
+            self.ricagr_count = 0
+
+            data = {"prio": self.ricagr_req}
+            for i in range(self.size):
+                if i != self.id:
+                    self.send(i, typ=MTyp.REQ, data=data)
+            
+            return True
+        return False
     
-    def lamport_comm_thread(self):
+    def ricagr_recv(self):
+        m = self._recv()
+        if m:
+            if m.typ == MTyp.REQ:
+                prio = m.data["prio"]
+                if self.status != St.IDLE and (self.ricagr_req, self.id) < (prio, m.sender):
+                        heapq.heappush(self.procqu, (prio, m.sender))
+                else:
+                    self.send(m.sender, typ=MTyp.ACK)
+                
+            elif m.typ == MTyp.ACK:
+                if self.status == St.WAIT:
+                    self.ricagr_count += 1
+                    if self.ricagr_count == self.size-1:
+                        self.debug("----CAN ENTER----", lvl=2)
+                        if self.crit_lock.locked():
+                            self.crit_lock.release()
+
+    def ricagr_post(self):
+        for _, tid in heapq.nsmallest(len(self.procqu), self.procqu):
+            self.send(tid, typ=MTyp.ACK)
+        self.ricagr_count = 0
+        self.procqu = []
+                
+
+    
+    def comm_thread(self, recv_f):
         self.debug("START COMM", lvl=2)
         while 1:
             self.sem.acquire()
-            self.lamport_recv()
+            recv_f()
 
     def run(self):
+        CS_FUNCSET = {
+            CSAlg.LAMPORT: (self.lamport_recv, self.lamport_try, self.lamport_post),
+            CSAlg.RIC_AGR: (self.ricagr_recv, self.ricagr_try, self.ricagr_post)
+        }
         if self.sync:
             self.sync.acquire()
+        recv_f, try_f, post_f = CS_FUNCSET[self.crit_sec_alg]
         self.debug("START", lvl=2)
-        com_th = Thread(target=self.lamport_comm_thread, daemon=True)
+        com_th = Thread(target=self.comm_thread, daemon=True, args=[recv_f])
         com_th.start()
         while 1:
             tid = randintnot(0, self.size-1, self.id)
             self.send(tid)
             if random.random() < 1/self.size:
-                if self.lamport_try():
+                if try_f():
                     debug("---------WAIT  {}----------|".format(self.id))
                     self.crit_lock.acquire()
                     self.critical_section()
+                    if post_f:
+                        post_f()
             time.sleep(2*random.random())
         self.debug("FIN", lvl=2)
 
@@ -176,10 +232,10 @@ class WorkerPool:
         self.all_th = []
         self.sync = Semaphore(value=0) if has_sync else None
     
-    def spawn_threads(self):
+    def spawn_threads(self, crit_sec_alg=CSAlg.LAMPORT):
         self.all_th = []
         for id in range(self.count):
-            t = Worker(id, self.count, self, self.sync)
+            t = Worker(id, self.count, self, self.sync, crit_sec_alg)
             t.start()
             self.all_th.append(t)
 
@@ -215,7 +271,8 @@ class WorkerPool:
 if __name__=="__main__":
     pool = WorkerPool(5)
 
-    pool.spawn_threads()
+    DEBUG_LVL = 1
+    pool.spawn_threads(crit_sec_alg=CSAlg.RIC_AGR)
     
     # pool.start_monitor()
     pool.start_pool()
