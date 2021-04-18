@@ -42,12 +42,13 @@ def debug(*args, **kwargs):
 
 DEBUG_LVL = 1
 
-class CSAlg(Enum):
-    LAMPORT = 0
-    RIC_AGR = 1
+class PTyp(Enum):
+    X=1
+    Y=2
+    Z=3
 
 class Worker(Thread):
-    def __init__(self, id, size, pool, sync=None):
+    def __init__(self, id, size, pool, ptype, sync=None):
         Thread.__init__(self, daemon=True)
         self.id = id
         self.size = size
@@ -62,14 +63,33 @@ class Worker(Thread):
         self.sync = sync
         self.ricagr_count = 0
         self.ricagr_req = None
+        self.ptype = ptype
+        i, t = pool.id_to_ingroup(self.id)
+        self.desc = f"{t.name.lower()}{i}"
 
     def debug(self, *args, **kwargs):
-        debug("[{}]".format(self.id), *args, **kwargs)
+        debug("({}) [{}]".format(self.desc, self.id), *args, **kwargs)
 
-    def send(self, tid, typ=MTyp.DEF, data={}):
-        self.lclock += 1
-        self.pool.qu[tid].append(TMsg(typ, self.id, data, self.lclock))
-        self.pool.sem[tid].release()
+    def debug_long(self, TAG, *args, **kwargs):
+        c="-"
+        if type(TAG)==tuple and len(TAG)==2:
+            TAG, c = TAG
+        lens=(10, 8, 10)
+        pad = " " * max(0, lens[1]-len(TAG)-len(self.desc))
+        msg = "-"*lens[0]+TAG+pad+self.desc+"-"*lens[2]+c
+        debug(msg, *args, **kwargs)
+
+    def send(self, tid, typ=MTyp.DEF, data={}, exception=None):
+        if type(exception)==int and exception==tid or type(exception)==list and tid in exception:
+            return
+        else:
+            self.lclock += 1
+            self.pool.qu[tid].append(TMsg(typ, self.id, data, self.lclock))
+            self.pool.sem[tid].release()
+    
+    def send_to_typ(self, typ:PTyp, **kwargs):
+        for i in self.pool.th_by_typ[typ]:
+            send(i, **kwargs)
 
     def _recv(self) -> TMsg:
         q = self.qu
@@ -89,14 +109,14 @@ class Worker(Thread):
     def critical_section(self, sect_time=2):
         global all_th
         self.status = St.CRIT
-        debug("---------CRIT  {}----------<".format(self.id))
+        self.debug_long(("CRIT", "<"))
 
         for i in range(sect_time):
             self.debug("[msg {}/{}] IN CRIT:".format(i+1, sect_time), self.pool.status_report(St.CRIT),
                 "WAIT:", self.pool.status_report(St.WAIT), lvl=1)
             time.sleep(1)
-
-        debug("---------LEAVE {}---------->".format(self.id))
+        
+        self.debug_long(("LEAVE", ">"))
         self.status = St.IDLE
 
     def queue_remove_entry_for(self, sender):
@@ -111,7 +131,7 @@ class Worker(Thread):
 
     def ricagr_try(self):
         if self.status == St.IDLE:
-            debug("---------TRY   {}----------?".format(self.id))
+            self.debug_long(("TRY", "?"))
             self.status = St.WAIT
             self.ricagr_req = self.lclock
             self.ricagr_count = 0
@@ -138,7 +158,8 @@ class Worker(Thread):
                 if self.status == St.WAIT:
                     self.ricagr_count += 1
                     if self.ricagr_count == self.size-1:
-                        self.debug("----CAN ENTER----", lvl=2)
+                        # self.debug("----CAN ENTER----", lvl=2)
+
                         if self.crit_lock.locked():
                             self.crit_lock.release()
 
@@ -164,7 +185,7 @@ class Worker(Thread):
         while 1:
             if random.random() < 1/self.size:
                 if try_f():
-                    debug("---------WAIT  {}----------|".format(self.id))
+                    self.debug_long(("WAIT", "|"))
                     self.crit_lock.acquire()
                     self.critical_section()
                     if post_f:
@@ -174,19 +195,38 @@ class Worker(Thread):
 
 
 class WorkerPool:
-    def __init__(self, count, has_sync=True):
+    def __init__(self, cx, cy, cz, has_sync=True):
+        self.counts = (cx, cy, cz)
+        self.ptypes = (PTyp.X, PTyp.Y, PTyp.Z)
+        self.cx, self.cy, self.cz = self.counts
+        count = cx + cy + cz
         self.count = count
         self.qu: list[TMsg] = [deque() for _ in range(count)]
         self.sem: list[Semaphore] = [Semaphore(value=0) for _ in range(count)]
         self.all_th = []
         self.sync = Semaphore(value=0) if has_sync else None
+        self.th_by_typ = {}
+    
+    def id_to_ingroup(self, id):
+        idg = id
+        for ci, typ in zip(self.counts, self.ptypes):
+            if idg < ci:
+                return idg, typ
+            else:
+                idg -= ci
+        return -1, None
     
     def spawn_threads(self):
         self.all_th = []
-        for id in range(self.count):
-            t = Worker(id, self.count, self, self.sync)
-            t.start()
-            self.all_th.append(t)
+        id = 0
+        for ci, typ in zip(self.counts, self.ptypes):
+            self.th_by_typ[typ] = []
+            for i in range(ci):
+                t = Worker(id, self.count, self, typ, self.sync)
+                t.start()
+                self.all_th.append(t)
+                self.th_by_typ[typ].append(id)
+                id += 1
 
     def status_report(self, comp=None):
         if not comp:
@@ -218,7 +258,7 @@ class WorkerPool:
             t.join()
 
 if __name__=="__main__":
-    pool = WorkerPool(5)
+    pool = WorkerPool(2, 3, 4)
 
     DEBUG_LVL = 1
     pool.spawn_threads()
