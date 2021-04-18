@@ -1,32 +1,11 @@
 from threading import Thread, Semaphore, Lock
 from collections import deque
 import heapq
-from dataclasses import dataclass
-from enum import Enum
 import time
 import random
 import sys
 
-
-
-class MTyp(Enum):
-    DEF = 0
-    FIN = 1
-    REQ = 2
-    ACK = 3
-    REL = 4
-
-class St(Enum):
-    IDLE = 0
-    WAIT = 1
-    CRIT = 2
-
-@dataclass
-class TMsg:
-    typ: MTyp
-    sender: int
-    data: dict
-    cl: int
+from ds_types import *
 
 def randintnot(a, b, n):
     return random.randint(*[(a, n-1), (n+1, b)][random.random()>(n-a)/(b-a)])
@@ -41,11 +20,6 @@ def debug(*args, **kwargs):
         print(*args, **kwargs)
 
 DEBUG_LVL = 1
-
-class PTyp(Enum):
-    X=1
-    Y=2
-    Z=3
 
 class Worker(Thread):
     def __init__(self, id, size, pool, ptype, sync=None):
@@ -91,6 +65,12 @@ class Worker(Thread):
         for i in self.pool.th_by_typ[typ]:
             send(i, **kwargs)
 
+    def get_typ(self, id):
+        return self.pool.id_to_ingroup(id)[1]
+
+    def get_desc(self, id):
+        return self.pool
+
     def _recv(self) -> TMsg:
         q = self.qu
         if q:
@@ -98,8 +78,8 @@ class Worker(Thread):
             lclock = max(self.lclock, m.cl) + 1
 
             prio = 2 if m.typ != MTyp.DEF else 3
-            self.debug("[<-{}-{}] [cl {}->{}] RECV: cl={}, data=\"{}\""
-                .format(m.typ.name, m.sender, self.lclock, lclock, m.cl, m.data), lvl=prio)
+            self.debug("[<-{}-{}({})] [cl {}->{}] RECV: cl={}, data=\"{}\""
+                .format(m.typ.name, m.sender, self.pool.get_desc(m.sender), self.lclock, lclock, m.cl, m.data), lvl=prio)
             
             self.lclock = lclock
             return m
@@ -193,74 +173,14 @@ class Worker(Thread):
             time.sleep(2*random.random())
         self.debug("FIN", lvl=2)
 
+DEBUG_LVL = 3
+from worker_pool import *
 
-class WorkerPool:
-    def __init__(self, cx, cy, cz, has_sync=True):
-        self.counts = (cx, cy, cz)
-        self.ptypes = (PTyp.X, PTyp.Y, PTyp.Z)
-        self.cx, self.cy, self.cz = self.counts
-        count = cx + cy + cz
-        self.count = count
-        self.qu: list[TMsg] = [deque() for _ in range(count)]
-        self.sem: list[Semaphore] = [Semaphore(value=0) for _ in range(count)]
-        self.all_th = []
-        self.sync = Semaphore(value=0) if has_sync else None
-        self.th_by_typ = {}
-    
-    def id_to_ingroup(self, id):
-        idg = id
-        for ci, typ in zip(self.counts, self.ptypes):
-            if idg < ci:
-                return idg, typ
-            else:
-                idg -= ci
-        return -1, None
-    
-    def spawn_threads(self):
-        self.all_th = []
-        id = 0
-        for ci, typ in zip(self.counts, self.ptypes):
-            self.th_by_typ[typ] = []
-            for i in range(ci):
-                t = Worker(id, self.count, self, typ, self.sync)
-                t.start()
-                self.all_th.append(t)
-                self.th_by_typ[typ].append(id)
-                id += 1
-
-    def status_report(self, comp=None):
-        if not comp:
-            return " ".join([str(i) + ": {}".format(t.status.name) for i, t in enumerate(self.all_th[:self.count])])
-        else:
-            return " ".join([(str(i) if t.status==comp else "_") for i, t in enumerate(self.all_th[:self.count])])
-
-    def start_pool(self, quiet=False):
-        self.sync.release(self.count)
-        if not quiet:
-            print(self.status_report())
-
-    def _mon_fun(self):
-        while 1:
-            stat = self.status_report()
-            retl_expr = "\r"
-            sys.stdout.write(stat+retl_expr)
-            time.sleep(1)
-
-    def start_monitor(self, ivl=1):
-        global DEBUG_LVL
-        DEBUG_LVL = 0
-        t = Thread(target=self._mon_fun)
-        self.all_th.append(t)
-        t.start()
-
-    def join(self):
-        for t in self.all_th:
-            t.join()
 
 if __name__=="__main__":
     pool = WorkerPool(2, 3, 4)
 
-    DEBUG_LVL = 1
+    
     pool.spawn_threads()
     
     # pool.start_monitor()
