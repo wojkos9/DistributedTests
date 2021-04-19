@@ -7,6 +7,7 @@ class MTyp(Enum):
     REQ = 2
     ACK = 3
     REL = 4
+    PAR = 5
 
 class St(Enum):
     IDLE = 0

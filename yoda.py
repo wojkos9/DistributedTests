@@ -44,6 +44,7 @@ class GenericWorker(Thread):
         i, t = pool.id_to_ingroup(self.id)
         self.desc = f"{t.name.lower()}{i}"
         self.pqus = {PTyp.X: [], PTyp.Y: [], PTyp.Z: []}
+        self.pair = None
 
     def debug(self, *args, **kwargs):
         debug("({}) [{}]".format(self.desc, self.id), *args, **kwargs)
@@ -57,23 +58,25 @@ class GenericWorker(Thread):
         msg = "-"*lens[0]+TAG+pad+self.desc+"-"*lens[2]+c
         debug(msg, *args, **kwargs)
 
-    def send(self, tid, typ=MTyp.DEF, data={}, exception=None):
+    def send(self, tid, typ=MTyp.DEF, data={}, exception=None, verb=False):
         if type(exception)==int and exception==tid or type(exception)==list and tid in exception:
             return
         else:
             self.lclock += 1
             self.pool.qu[tid].append(TMsg(typ, self.id, data, self.lclock))
             self.pool.sem[tid].release()
+            if verb:
+                print(f"{self.desc} SEND TO {self.desc_for(tid)}")
     
-    def send_to_typ(self, typ:PTyp, **kwargs):
-        for i in self.pool.th_by_typ[typ]:
-            send(i, **kwargs)
+    def send_to_typ(self, ptyp:PTyp, **kwargs):
+        for i in self.pool.th_by_typ[ptyp]:
+            self.send(i, exception=self.id, **kwargs)
 
     def get_typ(self, id):
         return self.pool.id_to_ingroup(id)[1]
 
-    def get_desc(self, id):
-        return self.pool
+    def desc_for(self, id):
+        return self.pool.get_desc(id)
 
     def _recv(self) -> TMsg:
         q = self.qu
@@ -90,10 +93,16 @@ class GenericWorker(Thread):
         else:
             return None
 
-    def critical_section(self, sect_time=2):
+    def critical_section(self, sect_time=4):
         global all_th
         self.status = St.CRIT
         self.debug_long(("CRIT", "<"))
+
+        if self.ptype == PTyp.X:
+            # for p in self.pqus[PTyp.Y]:
+            #     self.send(p, MTyp.ACK, verb=True)
+            self.send_to_typ(PTyp.Y, typ=MTyp.ACK, verb=True)
+            self.crit_lock.acquire()
 
         for i in range(sect_time):
             self.debug("[msg {}/{}] IN CRIT:".format(i+1, sect_time), self.pool.status_report(St.CRIT),
@@ -114,10 +123,18 @@ class GenericWorker(Thread):
             self.ricagr_count = 0
 
             data = {"prio": self.ricagr_req}
+            args = {"typ": MTyp.REQ, "data": data}
 
-            for i in range(self.size):
-                if i != self.id:
-                    self.send(i, typ=MTyp.REQ, data=data)
+            if self.ptype == PTyp.X:
+                self.send_to_typ(PTyp.X, **args)
+                self.send_to_typ(PTyp.Z, **args)
+            elif self.ptype == PTyp.Y:
+                self.send_to_typ(PTyp.Y, **args)
+                self.send_to_typ(PTyp.X, **args)
+            elif self.ptype == PTyp.Z:
+                # self.send_to_typ(PTyp.X, **args)
+                # self.send_to_typ(PTyp.Z, **args)
+                pass
             
             return True
         return False
@@ -125,34 +142,56 @@ class GenericWorker(Thread):
     def ricagr_recv(self):
         m = self._recv()
 
+        styp = self.get_typ(m.sender)
+        resp_all = False
         if self.ptype == PTyp.X:
-                need_size = self.cx + self.cz - 1
-            elif self.ptype == PTyp.YL
-                need_size = self.cy
-            else:
-                need_size = self.cx
+            need_size = self.cx + self.cz - 1
+            resp_all = styp==PTyp.Y and self.status == St.CRIT
+        elif self.ptype == PTyp.Y:
+            need_size = self.cy
+        elif self.ptype == PTyp.Z:
+            need_size = self.cx
+            resp_all = True
 
         if m:
             if m.typ == MTyp.REQ:
                 prio = m.data["prio"]
                 # if self.get_typ(m.sender) != self.ptype:
                 #     self.send(m.sender, typ=MTyp.ACK)
-                if self.status != St.IDLE and (self.ricagr_req, self.id) < (prio, m.sender):
-                    heapq.heappush(self.procqu, (prio, m.sender))
-                    heapq.heappush(self.pqu(m), (prio, m.sender))
-                else:
-                    self.send(m.sender, typ=MTyp.ACK)
+                if styp == self.ptype:
+                    if self.status != St.IDLE and (self.ricagr_req, self.id) < (prio, m.sender):
+                        heapq.heappush(self.procqu, (prio, m.sender))
+                        heapq.heappush(self.pqu(m), (prio, m.sender))
+                    else:
+                        self.send(m.sender, typ=MTyp.ACK, verb=resp_all)
+                elif resp_all:
+                    self.send(m.sender, typ=MTyp.ACK, verb=resp_all)
                 
             elif m.typ == MTyp.ACK:
                 if self.status == St.WAIT:
                     self.ricagr_count += 1
+                    if self.ptype == PTyp.Y and styp == PTyp.X:
+                        self.pair = m.sender
                     if self.ricagr_count == need_size:
+                        if self.ptype == PTyp.Y:
+                            if self.pair is None:
+                                raise Exception("Y NO PAIR")
+                            else:
+                                self.send(self.pair, MTyp.PAR)
+                                self.debug_long(f"YPAR {self.desc_for(self.pair)}")
                         if self.crit_lock.locked():
                             self.crit_lock.release()
+            elif m.typ == MTyp.PAR and self.ptype == PTyp.X:
+                self.pair = m.sender
+                self.debug_long(f"XPAR {self.desc_for(self.pair)}")
+                if self.crit_lock.locked():
+                    self.crit_lock.release()
 
     def ricagr_post(self):
-        for _, tid in heapq.nsmallest(len(self.procqu), self.procqu):
-            self.send(tid, typ=MTyp.ACK)
+        self.pair = None
+        if self.ptype != PTyp.Y:
+            for _, tid in heapq.nsmallest(len(self.procqu), self.procqu):
+                self.send(tid, typ=MTyp.ACK)
         self.ricagr_count = 0
         self.procqu = []
         for k in self.pqus.keys():
@@ -182,12 +221,12 @@ class GenericWorker(Thread):
             time.sleep(2*random.random())
         self.debug("FIN", lvl=2)
 
-DEBUG_LVL = 1
+DEBUG_LVL = 2
 from worker_pool import *
 
 
 if __name__=="__main__":
-    pool = WorkerPool(2, 3, 4)
+    pool = WorkerPool(4, 4, 4)
 
     
     pool.spawn_threads()
