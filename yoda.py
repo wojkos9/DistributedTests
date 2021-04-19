@@ -5,6 +5,8 @@ import time
 import random
 import sys
 
+from utils import queue_remove_entry_for
+
 from ds_types import *
 
 def randintnot(a, b, n):
@@ -21,7 +23,7 @@ def debug(*args, **kwargs):
 
 DEBUG_LVL = 1
 
-class Worker(Thread):
+class GenericWorker(Thread):
     def __init__(self, id, size, pool, ptype, sync=None):
         Thread.__init__(self, daemon=True)
         self.id = id
@@ -38,8 +40,10 @@ class Worker(Thread):
         self.ricagr_count = 0
         self.ricagr_req = None
         self.ptype = ptype
+        self.cx, self.cy, self.cz = pool.counts
         i, t = pool.id_to_ingroup(self.id)
         self.desc = f"{t.name.lower()}{i}"
+        self.pqus = {PTyp.X: [], PTyp.Y: [], PTyp.Z: []}
 
     def debug(self, *args, **kwargs):
         debug("({}) [{}]".format(self.desc, self.id), *args, **kwargs)
@@ -99,15 +103,8 @@ class Worker(Thread):
         self.debug_long(("LEAVE", ">"))
         self.status = St.IDLE
 
-    def queue_remove_entry_for(self, sender):
-        heap = self.procqu
-        reqi = next(filter(lambda i: heap[i][1]==sender, range(0, len(heap))), -1)
-        if reqi == -1:
-            raise Exception("Request not in list")
-        else:
-            heap[reqi] = self.procqu[-1]
-            heap.pop()
-            heapq.heapify(self.procqu)
+    def pqu(self, m):
+        return self.pqus[self.get_typ(m.sender)]
 
     def ricagr_try(self):
         if self.status == St.IDLE:
@@ -117,6 +114,7 @@ class Worker(Thread):
             self.ricagr_count = 0
 
             data = {"prio": self.ricagr_req}
+
             for i in range(self.size):
                 if i != self.id:
                     self.send(i, typ=MTyp.REQ, data=data)
@@ -126,20 +124,29 @@ class Worker(Thread):
     
     def ricagr_recv(self):
         m = self._recv()
+
+        if self.ptype == PTyp.X:
+                need_size = self.cx + self.cz - 1
+            elif self.ptype == PTyp.YL
+                need_size = self.cy
+            else:
+                need_size = self.cx
+
         if m:
             if m.typ == MTyp.REQ:
                 prio = m.data["prio"]
+                # if self.get_typ(m.sender) != self.ptype:
+                #     self.send(m.sender, typ=MTyp.ACK)
                 if self.status != St.IDLE and (self.ricagr_req, self.id) < (prio, m.sender):
-                        heapq.heappush(self.procqu, (prio, m.sender))
+                    heapq.heappush(self.procqu, (prio, m.sender))
+                    heapq.heappush(self.pqu(m), (prio, m.sender))
                 else:
                     self.send(m.sender, typ=MTyp.ACK)
                 
             elif m.typ == MTyp.ACK:
                 if self.status == St.WAIT:
                     self.ricagr_count += 1
-                    if self.ricagr_count == self.size-1:
-                        # self.debug("----CAN ENTER----", lvl=2)
-
+                    if self.ricagr_count == need_size:
                         if self.crit_lock.locked():
                             self.crit_lock.release()
 
@@ -148,6 +155,8 @@ class Worker(Thread):
             self.send(tid, typ=MTyp.ACK)
         self.ricagr_count = 0
         self.procqu = []
+        for k in self.pqus.keys():
+            self.pqus[k] = []
     
     def comm_thread(self, recv_f):
         self.debug("START COMM", lvl=2)
@@ -173,7 +182,7 @@ class Worker(Thread):
             time.sleep(2*random.random())
         self.debug("FIN", lvl=2)
 
-DEBUG_LVL = 3
+DEBUG_LVL = 1
 from worker_pool import *
 
 

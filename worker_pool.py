@@ -1,7 +1,7 @@
 from threading import Thread, Semaphore, Lock
 from collections import deque
 from ds_types import *
-from yoda import Worker
+from yoda import GenericWorker
 
 class WorkerPool:
     def __init__(self, cx, cy, cz, has_sync=True):
@@ -34,7 +34,7 @@ class WorkerPool:
         for ci, typ in zip(self.counts, self.ptypes):
             self.th_by_typ[typ] = []
             for i in range(ci):
-                t = Worker(id, self.count, self, typ, self.sync)
+                t = GenericWorker(id, ci, self, typ, sync=self.sync)
                 t.start()
                 self.all_th.append(t)
                 self.th_by_typ[typ].append(id)

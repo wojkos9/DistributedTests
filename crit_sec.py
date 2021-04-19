@@ -15,6 +15,8 @@ class MTyp(Enum):
     REQ = 2
     ACK = 3
     REL = 4
+    SYN = 5
+    REP = 6
 
 class St(Enum):
     IDLE = 0
@@ -47,7 +49,7 @@ class CSAlg(Enum):
     RIC_AGR = 1
 
 class Worker(Thread):
-    def __init__(self, id, size, pool, sync=None, crit_sec_alg=CSAlg.LAMPORT):
+    def __init__(self, id, size, pool, sync=None, crit_sec_alg=CSAlg.LAMPORT, is_reporter=False):
         Thread.__init__(self, daemon=True)
         self.id = id
         self.size = size
@@ -64,6 +66,8 @@ class Worker(Thread):
         self.ricagr_count = 0
         self.ricagr_req = None
         self.crit_sec_alg = crit_sec_alg
+        self.units = 100
+        self.is_reporter = is_reporter
 
     def debug(self, *args, **kwargs):
         debug("[{}] {}".format(self.id, self.crit_sec_alg.name), *args, **kwargs)
@@ -72,6 +76,11 @@ class Worker(Thread):
         self.lclock += 1
         self.pool.qu[tid].append(TMsg(typ, self.id, data, self.lclock))
         self.pool.sem[tid].release()
+    
+    def send_units(self, tid, count):
+        self.units -= count
+        time.sleep(random.random()*2)
+        self.send(tid, data={"count": count})
 
     def _recv(self) -> TMsg:
         q = self.qu
@@ -79,11 +88,19 @@ class Worker(Thread):
             m = q.popleft()
             lclock = max(self.lclock, m.cl) + 1
 
-            prio = 2 if m.typ != MTyp.DEF else 3
+            prio = 2 if m.typ in (MTyp.REQ, MTyp.ACK, MTyp.REL) else 3
+            if m.typ == MTyp.REP:
+                prio = 0
             self.debug("[<-{}-{}] [cl {}->{}] RECV: cl={}, data=\"{}\""
                 .format(m.typ.name, m.sender, self.lclock, lclock, m.cl, m.data), lvl=prio)
             
             self.lclock = lclock
+
+            if m.typ == MTyp.REP and "units" not in m.data:
+                self.send(m.sender, MTyp.REP, {"units": self.units})
+            elif m.typ == MTyp.DEF:
+                self.units += m.data["count"]
+
             return m
         else:
             return None
@@ -190,14 +207,31 @@ class Worker(Thread):
             self.send(tid, typ=MTyp.ACK)
         self.ricagr_count = 0
         self.procqu = []
-                
-
     
     def comm_thread(self, recv_f):
         self.debug("START COMM", lvl=2)
         while 1:
             self.sem.acquire()
             recv_f()
+
+    def reporting_job(self):
+        while 1:
+            debug("---------COLLECT---------", lvl=0)
+            val = 0
+            for i in range(0, self.size):
+                self.send(i, typ=MTyp.REP)
+                debug("SENT TO", i, lvl=0)
+            resp = 0
+            while resp < self.size:
+                self.sem.acquire()
+                m = self._recv()
+                debug("RECV FR", m.sender, lvl=0)
+                if m.typ == MTyp.REP:
+                    val += m.data["units"]
+                    resp += 1
+            debug("TOTAL UNITS:", val, lvl=0)
+            time.sleep(1)
+
 
     def run(self):
         CS_FUNCSET = {
@@ -206,29 +240,35 @@ class Worker(Thread):
         }
         if self.sync:
             self.sync.acquire()
-        recv_f, try_f, post_f = CS_FUNCSET[self.crit_sec_alg]
+
         self.debug("START", lvl=2)
-        com_th = Thread(target=self.comm_thread, daemon=True, args=[recv_f])
-        com_th.start()
-        while 1:
-            tid = randintnot(0, self.size-1, self.id)
-            self.send(tid)
-            if random.random() < 1/self.size:
-                if try_f():
-                    debug("---------WAIT  {}----------|".format(self.id))
-                    self.crit_lock.acquire()
-                    self.critical_section()
-                    if post_f:
-                        post_f()
-            time.sleep(2*random.random())
+
+        if self.is_reporter:
+            self.reporting_job()
+        else:
+            recv_f, try_f, post_f = CS_FUNCSET[self.crit_sec_alg]
+            
+            com_th = Thread(target=self.comm_thread, daemon=True, args=[recv_f])
+            com_th.start()
+            while 1:
+                tid = randintnot(0, self.size-1, self.id)
+                self.send_units(tid, random.randint(1, 5))
+                if random.random() < 1/self.size:
+                    if try_f():
+                        debug("---------WAIT  {}----------|".format(self.id))
+                        self.crit_lock.acquire()
+                        self.critical_section()
+                        if post_f:
+                            post_f()
+                time.sleep(2*random.random())
         self.debug("FIN", lvl=2)
 
 
 class WorkerPool:
     def __init__(self, count, has_sync=True):
         self.count = count
-        self.qu: list[TMsg] = [deque() for _ in range(count)]
-        self.sem: list[Semaphore] = [Semaphore(value=0) for _ in range(count)]
+        self.qu: list[TMsg] = [deque() for _ in range(count+1)]
+        self.sem: list[Semaphore] = [Semaphore(value=0) for _ in range(count+1)]
         self.all_th = []
         self.sync = Semaphore(value=0) if has_sync else None
     
@@ -238,6 +278,7 @@ class WorkerPool:
             t = Worker(id, self.count, self, self.sync, crit_sec_alg)
             t.start()
             self.all_th.append(t)
+        Worker(self.count, self.count, self, self.sync, is_reporter=True).start()
 
     def status_report(self, comp=None):
         if not comp:
@@ -246,7 +287,7 @@ class WorkerPool:
             return " ".join([(str(i) if t.status==comp else "_") for i, t in enumerate(self.all_th[:self.count])])
 
     def start_pool(self, quiet=False):
-        self.sync.release(self.count)
+        self.sync.release(self.count+1)
         if not quiet:
             print(self.status_report())
 
@@ -271,7 +312,7 @@ class WorkerPool:
 if __name__=="__main__":
     pool = WorkerPool(5)
 
-    DEBUG_LVL = 1
+    DEBUG_LVL = 0
     pool.spawn_threads(crit_sec_alg=CSAlg.RIC_AGR)
     
     # pool.start_monitor()
